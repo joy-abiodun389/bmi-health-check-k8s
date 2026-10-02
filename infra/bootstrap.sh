@@ -16,6 +16,8 @@ CLUSTER_NAME="${CLUSTER_NAME:-etechapp-eks-4QAQxDD3}"
 ECR_REPOSITORY="${ECR_REPOSITORY:-bmi-health-check-api}"
 GITHUB_REPO="${GITHUB_REPO:-excelcloudOps/bmi-health-check-k8s}"
 ROLE_NAME="${ROLE_NAME:-github-actions-bmi-api-eks}"
+METRICS_ROLE_NAME="${METRICS_ROLE_NAME:-bmi-api-metrics}"
+METRICS_NAMESPACE="${METRICS_NAMESPACE:-BMI/HealthCheck}"
 NAMESPACE="${NAMESPACE:-bmi-api}"
 K8S_GROUP="${K8S_GROUP:-bmi-api-deployers}"
 K8S_USERNAME="${K8S_USERNAME:-gha-bmi-api}"
@@ -119,7 +121,19 @@ PERMISSIONS="$(cat <<JSON
       ],
       "Resource": "${REPO_ARN}"
     },
-    { "Sid": "EksDescribe", "Effect": "Allow", "Action": "eks:DescribeCluster", "Resource": "${CLUSTER_ARN}" }
+    { "Sid": "EksDescribe", "Effect": "Allow", "Action": "eks:DescribeCluster", "Resource": "${CLUSTER_ARN}" },
+    {
+      "Sid": "Observability",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:PutDashboard",
+        "cloudwatch:GetDashboard",
+        "cloudwatch:PutMetricAlarm",
+        "cloudwatch:DescribeAlarms",
+        "elasticloadbalancing:DescribeLoadBalancers"
+      ],
+      "Resource": "*"
+    }
   ]
 }
 JSON
@@ -130,6 +144,63 @@ aws iam put-role-policy \
   --policy-name "bmi-api-ecr-eks" \
   --policy-document "$PERMISSIONS"
 echo "    inline policy bmi-api-ecr-eks applied"
+
+echo "==> IRSA role ${METRICS_ROLE_NAME} (pod -> CloudWatch metrics)"
+OIDC_ISSUER="$(aws eks describe-cluster --region "$AWS_REGION" --name "$CLUSTER_NAME" \
+  --query 'cluster.identity.oidc.issuer' --output text)"
+OIDC_HOST="${OIDC_ISSUER#https://}"
+EKS_OIDC_ARN="arn:aws:iam::${ACCOUNT_ID}:oidc-provider/${OIDC_HOST}"
+
+METRICS_TRUST="$(cat <<JSON
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "Federated": "${EKS_OIDC_ARN}" },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "${OIDC_HOST}:aud": "sts.amazonaws.com",
+          "${OIDC_HOST}:sub": "system:serviceaccount:${NAMESPACE}:bmi-api"
+        }
+      }
+    }
+  ]
+}
+JSON
+)"
+
+if aws iam get-role --role-name "$METRICS_ROLE_NAME" >/dev/null 2>&1; then
+  aws iam update-assume-role-policy --role-name "$METRICS_ROLE_NAME" --policy-document "$METRICS_TRUST"
+  echo "    trust policy updated"
+else
+  aws iam create-role \
+    --role-name "$METRICS_ROLE_NAME" \
+    --description "BMI API pods publishing CloudWatch metrics" \
+    --assume-role-policy-document "$METRICS_TRUST" >/dev/null
+  echo "    created"
+fi
+
+# Scoped to one metric namespace so the pod cannot write anywhere else.
+aws iam put-role-policy \
+  --role-name "$METRICS_ROLE_NAME" \
+  --policy-name "put-metric-data" \
+  --policy-document "$(cat <<JSON
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "cloudwatch:PutMetricData",
+      "Resource": "*",
+      "Condition": { "StringEquals": { "cloudwatch:namespace": "${METRICS_NAMESPACE}" } }
+    }
+  ]
+}
+JSON
+)"
+echo "    inline policy put-metric-data applied"
 
 echo "==> Namespace and RBAC"
 kubectl apply -f "${SCRIPT_DIR}/namespace-and-rbac.yaml"

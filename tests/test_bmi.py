@@ -2,6 +2,7 @@ from app.bmi import calculate_bmi, categorize_bmi
 from fastapi.testclient import TestClient
 import pytest
 
+from app import metrics
 from app.main import app
 
 client = TestClient(app)
@@ -59,6 +60,41 @@ def test_ui_home():
     assert "text/html" in response.headers["content-type"]
     assert "BMI Health Check" in response.text
     assert "/static/excelcloud-logo.jpg" in response.text
+
+
+def test_metrics_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("METRICS_ENABLED", raising=False)
+    assert metrics.metrics_enabled() is False
+
+
+def test_metrics_collector_aggregates():
+    collector = metrics.MetricsCollector()
+    collector.record_request(12.5, 200)
+    collector.record_request(30.0, 500)
+    collector.record_bmi_calculation()
+
+    window = collector.drain()
+    assert window.requests == 2
+    assert window.errors == 1
+    assert window.bmi_calculations == 1
+
+    data = {item["MetricName"]: item for item in metrics.build_metric_data(window)}
+    assert data["RequestCount"]["Value"] == 2
+    assert data["ErrorCount"]["Value"] == 1
+    assert data["LatencyMs"]["StatisticValues"]["SampleCount"] == 2
+    assert data["LatencyMs"]["StatisticValues"]["Maximum"] == 30.0
+
+    # Draining resets the window so counts are never double-reported.
+    assert collector.drain().is_empty()
+
+
+def test_requests_are_recorded_by_middleware():
+    before = metrics.collector.drain()
+    assert before.is_empty() or before.requests >= 0
+
+    client.get("/health")
+    window = metrics.collector.drain()
+    assert window.requests >= 1
 
 
 def test_brand_assets_served():

@@ -3,7 +3,17 @@ kind: Service
 metadata:
   name: bmi-api
   annotations:
+    # NLB is the cheapest managed load balancer (~$0.0225/hr) and the nodes sit
+    # in private subnets, so a NodePort would not be reachable from the internet.
     service.beta.kubernetes.io/aws-load-balancer-type: nlb
     service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+    # Only two of three AZs run nodes; without cross-zone the NLB address in the
+    # empty AZ would blackhole roughly a third of requests.
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: HTTP
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: /health
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-healthy-threshold: "2"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-unhealthy-threshold: "2"
 spec:
   type: LoadBalancer
+  externalTrafficPolicy: Cluster

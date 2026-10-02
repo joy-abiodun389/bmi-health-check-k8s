@@ -1,0 +1,92 @@
+{
+  "widgets": [
+    {
+      "type": "text",
+      "x": 0,
+      "y": 0,
+      "width": 24,
+      "height": 2,
+      "properties": {
+        "markdown": "# BMI Health Check — performance\nApp metrics are published every 60s by the pods themselves (namespace `BMI/HealthCheck`, dimension `Service=bmi-api`). Load balancer and EC2 metrics are provided by AWS at no extra cost."
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 2,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "Request volume",
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "__REGION__",
+        "period": 60,
+        "stat": "Sum",
+        "metrics": [
+          ["BMI/HealthCheck", "RequestCount", "Service", "bmi-api", { "label": "Requests" }],
+          [".", "BmiCalculations", ".", ".", { "label": "BMI calculations" }]
+        ],
+        "yAxis": { "left": { "label": "Count/min", "showUnits": false, "min": 0 } }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12,
+      "y": 2,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "Latency (ms)",
+        "view": "timeSeries",
+        "region": "__REGION__",
+        "period": 60,
+        "metrics": [
+          ["BMI/HealthCheck", "LatencyMs", "Service", "bmi-api", { "stat": "Average", "label": "Average" }],
+          ["...", { "stat": "Maximum", "label": "Max" }]
+        ],
+        "yAxis": { "left": { "label": "ms", "showUnits": false, "min": 0 } }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 8,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "Errors and error rate",
+        "view": "timeSeries",
+        "region": "__REGION__",
+        "period": 60,
+        "metrics": [
+          [{ "expression": "100 * (errors / MAX([requests, 1]))", "label": "Error rate %", "yAxis": "right" }],
+          ["BMI/HealthCheck", "ErrorCount", "Service", "bmi-api", { "id": "errors", "stat": "Sum", "label": "5xx responses" }],
+          [".", "RequestCount", ".", ".", { "id": "requests", "stat": "Sum", "visible": false }]
+        ],
+        "yAxis": {
+          "left": { "label": "Count", "showUnits": false, "min": 0 },
+          "right": { "label": "%", "showUnits": false, "min": 0, "max": 100 }
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12,
+      "y": 8,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "EKS node CPU",
+        "view": "timeSeries",
+        "region": "__REGION__",
+        "period": 300,
+        "stat": "Average",
+        "metrics": [
+          [{ "expression": "SEARCH('{AWS/EC2,InstanceId} MetricName=\"CPUUtilization\"', 'Average', 300)", "label": "" }]
+        ],
+        "yAxis": { "left": { "label": "%", "showUnits": false, "min": 0, "max": 100 } }
+      }
+    }
+  ]
+}

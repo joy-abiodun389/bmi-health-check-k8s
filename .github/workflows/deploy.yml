@@ -1,17 +1,25 @@
 name: Build and Deploy to EKS
 
 on:
+  # Validates every PR: tests, build, and Trivy scan, but no push or deploy.
+  pull_request:
+    branches: [main]
+  # Merging a PR lands a push on main, which runs the full pipeline.
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      expose_public:
+        description: 'Expose the UI on the public NLB'
+        type: boolean
+        default: true
 
 permissions:
   id-token: write
   contents: read
-  security-events: write
 
 concurrency:
-  group: deploy-eks
+  group: deploy-eks-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -20,6 +28,7 @@ env:
   ECR_REPOSITORY: bmi-health-check-api
   K8S_NAMESPACE: bmi-api
   DEPLOYMENT: bmi-api
+  DASHBOARD_NAME: bmi-health-check
 
 jobs:
   test:
@@ -45,6 +54,7 @@ jobs:
       image_ref: ${{ steps.digest.outputs.image_ref }}
     env:
       IMAGE_TAG: ${{ github.sha }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
     steps:
       - uses: actions/checkout@v4
 
@@ -77,6 +87,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Scan image with Trivy
+        id: trivy
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.IMAGE_URI }}:${{ env.IMAGE_TAG }}
@@ -84,6 +95,18 @@ jobs:
           exit-code: "1"
           severity: CRITICAL,HIGH
           ignore-unfixed: true
+
+      - name: Notify Slack — scan passed
+        if: success() && env.SLACK_WEBHOOK_URL != ''
+        run: ./.github/scripts/slack-notify.sh pass
+        env:
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
+
+      - name: Notify Slack — scan failed
+        if: failure() && env.SLACK_WEBHOOK_URL != ''
+        run: ./.github/scripts/slack-notify.sh fail
+        env:
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
 
       - name: Upload Trivy SARIF (informational)
         if: always()
@@ -106,11 +129,14 @@ jobs:
           path: trivy-results.sarif
           retention-days: 14
 
+      # Pull requests stop here: the image is proven but never published.
       - name: Push image to ECR
+        if: github.event_name != 'pull_request'
         run: docker push "${IMAGE_URI}:${IMAGE_TAG}"
 
       - name: Resolve image digest
         id: digest
+        if: github.event_name != 'pull_request'
         run: |
           set -euo pipefail
           DIGEST=$(aws ecr describe-images \
@@ -123,9 +149,13 @@ jobs:
   deploy:
     name: Deploy to EKS
     needs: build-scan-push
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     env:
       IMAGE_REF: ${{ needs.build-scan-push.outputs.image_ref }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      # Default to the public NLB overlay; manual runs can opt out.
+      EXPOSE_PUBLIC: ${{ github.event_name == 'workflow_dispatch' && inputs.expose_public || 'true' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -141,8 +171,13 @@ jobs:
       - name: Apply manifests
         run: |
           set -euo pipefail
-          echo "Deploying ${IMAGE_REF}"
-          kubectl kustomize k8s/base \
+          if [ "$EXPOSE_PUBLIC" = "true" ]; then
+            OVERLAY=k8s/overlays/public
+          else
+            OVERLAY=k8s/base
+          fi
+          echo "Deploying ${IMAGE_REF} from ${OVERLAY}"
+          kubectl kustomize "$OVERLAY" \
             | sed "s|__IMAGE__|${IMAGE_REF}|g" \
             | kubectl apply -f -
 
@@ -183,6 +218,42 @@ jobs:
           print("Smoke tests passed")
           PY
 
+      - name: Wait for load balancer
+        id: lb
+        if: env.EXPOSE_PUBLIC == 'true'
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 40); do
+            HOST=$(kubectl -n "$K8S_NAMESPACE" get svc "$DEPLOYMENT" \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+            if [ -n "$HOST" ]; then
+              echo "hostname=${HOST}" >> "$GITHUB_OUTPUT"
+              echo "Load balancer: ${HOST}"
+              break
+            fi
+            echo "waiting for load balancer (${attempt}/40)"
+            sleep 15
+          done
+          if [ -z "${HOST:-}" ]; then
+            echo "Load balancer did not get an address in time"
+            exit 1
+          fi
+          # Targets take a couple of health check cycles to come into service.
+          for attempt in $(seq 1 40); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://${HOST}/health" || true)
+            if [ "$CODE" = "200" ]; then
+              echo "Public endpoint healthy after ${attempt} attempt(s)"
+              exit 0
+            fi
+            echo "public endpoint not ready yet (http ${CODE}, ${attempt}/40)"
+            sleep 15
+          done
+          echo "Public endpoint never returned 200"
+          exit 1
+
+      - name: Publish CloudWatch dashboard and alarms
+        run: ./infra/apply-observability.sh
+
       - name: Deployment summary
         run: |
           {
@@ -191,14 +262,18 @@ jobs:
             echo "- Cluster: \`${EKS_CLUSTER}\` (${AWS_REGION})"
             echo "- Namespace: \`${K8S_NAMESPACE}\`"
             echo "- Image: \`${IMAGE_REF}\`"
-            echo ""
-            echo "Reach it from inside the cluster:"
-            echo ""
-            echo '```'
-            echo "kubectl -n ${K8S_NAMESPACE} port-forward svc/${DEPLOYMENT} 8080:80"
-            echo '```'
+            if [ -n "${{ steps.lb.outputs.hostname }}" ]; then
+              echo "- Public UI: http://${{ steps.lb.outputs.hostname }}/"
+            fi
+            echo "- Dashboard: https://${AWS_REGION}.console.aws.amazon.com/cloudwatch/home?region=${AWS_REGION}#dashboards:name=${DASHBOARD_NAME}"
           } >> "$GITHUB_STEP_SUMMARY"
           kubectl -n "$K8S_NAMESPACE" get deploy,svc,pods -o wide
+
+      - name: Notify Slack — deploy result
+        if: always() && env.SLACK_WEBHOOK_URL != ''
+        run: ./.github/scripts/slack-notify.sh "${{ job.status }}"
+        env:
+          APP_URL: ${{ steps.lb.outputs.hostname }}
 
       - name: Diagnostics on failure
         if: failure()
@@ -208,6 +283,9 @@ jobs:
           echo "::endgroup::"
           echo "::group::Pod descriptions"
           kubectl -n "$K8S_NAMESPACE" describe pods || true
+          echo "::endgroup::"
+          echo "::group::Service"
+          kubectl -n "$K8S_NAMESPACE" describe svc "$DEPLOYMENT" || true
           echo "::endgroup::"
           echo "::group::Recent events"
           kubectl -n "$K8S_NAMESPACE" get events --sort-by=.lastTimestamp | tail -40 || true

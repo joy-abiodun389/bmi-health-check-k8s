@@ -51,6 +51,18 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: METRICS_ENABLED
+              value: "true"
+            - name: METRICS_NAMESPACE
+              value: BMI/HealthCheck
+            - name: METRICS_FLUSH_SECONDS
+              value: "60"
+            - name: AWS_REGION
+              value: us-east-2
+            # boto3 looks for a config file under HOME; the root filesystem
+            # is read-only, so point it at the tmpfs mount.
+            - name: HOME
+              value: /tmp
           resources:
             requests:
               cpu: 50m

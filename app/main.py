@@ -2,22 +2,55 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
+import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from app import metrics
 from app.bmi import calculate_bmi
 
 APP_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = APP_DIR / "templates"
 STATIC_DIR = APP_DIR / "static"
 
-app = FastAPI(title="BMI Health Check", version="1.1.0")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    if not metrics.metrics_enabled():
+        yield
+        return
+
+    stop = asyncio.Event()
+    publisher = asyncio.create_task(metrics.publish_loop(stop))
+    try:
+        yield
+    finally:
+        stop.set()
+        await publisher
+
+
+app = FastAPI(title="BMI Health Check", version="1.2.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.middleware("http")
+async def track_request_metrics(request: Request, call_next):
+    started = time.perf_counter()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        metrics.collector.record_request(elapsed_ms, status_code)
 
 
 class BmiRequest(BaseModel):
@@ -43,6 +76,7 @@ class HealthResponse(BaseModel):
 
 
 def _to_response(result) -> BmiResponse:
+    metrics.collector.record_bmi_calculation()
     return BmiResponse(
         height_cm=result.height_cm,
         weight_kg=result.weight_kg,
