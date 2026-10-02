@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# The namespace itself is created once by infra/bootstrap.sh so CI does not
+# need cluster-scoped permissions.
+namespace: bmi-api
+
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/part-of: bmi-health-check
+
+resources:
+  - serviceaccount.yaml
+  - deployment.yaml
+  - service.yaml
+  - pdb.yaml

@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Opt-in overlay: exposes the API on an internet-facing NLB.
+# This provisions a real load balancer and therefore costs roughly
+# $16-18/month plus data processing. The base (ClusterIP) is free.
+namespace: bmi-api
+
+resources:
+  - ../../base
+
+patches:
+  - path: service-loadbalancer.yaml
+    target:
+      kind: Service
+      name: bmi-api

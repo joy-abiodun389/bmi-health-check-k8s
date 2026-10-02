@@ -1,0 +1,214 @@
+name: Build and Deploy to EKS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  security-events: write
+
+concurrency:
+  group: deploy-eks
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-2
+  EKS_CLUSTER: etechapp-eks-4QAQxDD3
+  ECR_REPOSITORY: bmi-health-check-api
+  K8S_NAMESPACE: bmi-api
+  DEPLOYMENT: bmi-api
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r app/requirements.txt -r requirements-dev.txt
+      - name: Run tests
+        run: PYTHONPATH=. pytest -q
+
+  build-scan-push:
+    name: Build, scan, and push image
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image_ref: ${{ steps.digest.outputs.image_ref }}
+    env:
+      IMAGE_TAG: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_IAM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image metadata
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: echo "IMAGE_URI=${REGISTRY}/${ECR_REPOSITORY}" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ env.IMAGE_URI }}:${{ env.IMAGE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_URI }}:${{ env.IMAGE_TAG }}
+          format: table
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF (informational)
+        if: always()
+        uses: aquasecurity/trivy-action@v0.36.0
+        continue-on-error: true
+        with:
+          image-ref: ${{ env.IMAGE_URI }}:${{ env.IMAGE_TAG }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+          ignore-unfixed: true
+
+      - name: Upload SARIF to GitHub Security
+        if: always() && hashFiles('trivy-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Push image to ECR
+        run: docker push "${IMAGE_URI}:${IMAGE_TAG}"
+
+      - name: Resolve image digest
+        id: digest
+        run: |
+          set -euo pipefail
+          DIGEST=$(aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag="$IMAGE_TAG" \
+            --query 'imageDetails[0].imageDigest' --output text)
+          echo "image_ref=${IMAGE_URI}@${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Pushed ${IMAGE_URI}:${IMAGE_TAG} (${DIGEST})"
+
+  deploy:
+    name: Deploy to EKS
+    needs: build-scan-push
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_REF: ${{ needs.build-scan-push.outputs.image_ref }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_IAM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER"
+
+      - name: Apply manifests
+        run: |
+          set -euo pipefail
+          echo "Deploying ${IMAGE_REF}"
+          kubectl kustomize k8s/base \
+            | sed "s|__IMAGE__|${IMAGE_REF}|g" \
+            | kubectl apply -f -
+
+      - name: Wait for rollout
+        run: kubectl -n "$K8S_NAMESPACE" rollout status "deployment/${DEPLOYMENT}" --timeout=300s
+
+      - name: Smoke test in cluster
+        run: |
+          set -euo pipefail
+          POD=$(kubectl -n "$K8S_NAMESPACE" get pods \
+            -l app.kubernetes.io/name=bmi-api \
+            --field-selector status.phase=Running \
+            -o jsonpath='{.items[0].metadata.name}')
+          echo "Probing from pod ${POD}"
+          kubectl -n "$K8S_NAMESPACE" exec -i "$POD" -- python - <<'PY'
+          import json
+          import urllib.request
+
+          def get(url):
+              with urllib.request.urlopen(url, timeout=10) as response:
+                  return json.load(response)
+
+          health = get("http://127.0.0.1:8080/health")
+          assert health["status"] == "ok", health
+          print("health ok on pod", health.get("pod"), "node", health.get("node"))
+
+          # Through the Service, proving DNS and endpoint routing work.
+          bmi = get("http://bmi-api.bmi-api.svc.cluster.local/bmi?height_cm=175&weight_kg=70")
+          assert bmi["category"] == "normal", bmi
+          assert bmi["bmi"] == 22.9, bmi
+          assert bmi["health_advice"], bmi
+          assert bmi["exercises"], bmi
+          print("service routing ok, bmi", bmi["bmi"], bmi["category"])
+
+          page = urllib.request.urlopen("http://127.0.0.1:8080/", timeout=10).read().decode()
+          assert "BMI Health Check" in page
+          print("UI ok")
+          print("Smoke tests passed")
+          PY
+
+      - name: Deployment summary
+        run: |
+          {
+            echo "### Deployed to EKS"
+            echo ""
+            echo "- Cluster: \`${EKS_CLUSTER}\` (${AWS_REGION})"
+            echo "- Namespace: \`${K8S_NAMESPACE}\`"
+            echo "- Image: \`${IMAGE_REF}\`"
+            echo ""
+            echo "Reach it from inside the cluster:"
+            echo ""
+            echo '```'
+            echo "kubectl -n ${K8S_NAMESPACE} port-forward svc/${DEPLOYMENT} 8080:80"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          kubectl -n "$K8S_NAMESPACE" get deploy,svc,pods -o wide
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          echo "::group::Pods"
+          kubectl -n "$K8S_NAMESPACE" get pods -o wide || true
+          echo "::endgroup::"
+          echo "::group::Pod descriptions"
+          kubectl -n "$K8S_NAMESPACE" describe pods || true
+          echo "::endgroup::"
+          echo "::group::Recent events"
+          kubectl -n "$K8S_NAMESPACE" get events --sort-by=.lastTimestamp | tail -40 || true
+          echo "::endgroup::"
+          echo "::group::Container logs"
+          kubectl -n "$K8S_NAMESPACE" logs "deployment/${DEPLOYMENT}" --all-containers --tail=100 || true
+          echo "::endgroup::"
