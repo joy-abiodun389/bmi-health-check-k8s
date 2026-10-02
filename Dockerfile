@@ -7,6 +7,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /srv
 
+# Pick up Debian security fixes the base image predates (the Trivy gate
+# fails the build on fixable CRITICAL/HIGH findings).
+RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY app/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
