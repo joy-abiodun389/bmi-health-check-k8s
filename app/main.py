@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from contextlib import asynccontextmanager
@@ -19,6 +20,10 @@ from app.bmi import calculate_bmi
 APP_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = APP_DIR / "templates"
 STATIC_DIR = APP_DIR / "static"
+
+# Uvicorn only configures its own loggers, which would hide app-level
+# warnings such as a failing metrics publisher.
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 
 @asynccontextmanager

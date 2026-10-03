@@ -67,6 +67,19 @@ def test_metrics_disabled_by_default(monkeypatch):
     assert metrics.metrics_enabled() is False
 
 
+def test_region_falls_back_to_aws_region(monkeypatch):
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    monkeypatch.setenv("AWS_REGION", "us-east-2")
+    assert metrics.resolve_region() == "us-east-2"
+
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-west-2")
+    assert metrics.resolve_region() == "us-west-2"
+
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    assert metrics.resolve_region() is None
+
+
 def test_metrics_collector_aggregates():
     collector = metrics.MetricsCollector()
     collector.record_request(12.5, 200)

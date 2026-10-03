@@ -23,6 +23,11 @@ SERVICE = os.getenv("METRICS_SERVICE", "bmi-api")
 FLUSH_SECONDS = int(os.getenv("METRICS_FLUSH_SECONDS", "60"))
 
 
+def resolve_region() -> str | None:
+    """botocore only reads AWS_DEFAULT_REGION, so check AWS_REGION too."""
+    return os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or None
+
+
 def metrics_enabled() -> bool:
     return os.getenv("METRICS_ENABLED", "false").lower() == "true"
 
@@ -115,8 +120,17 @@ async def publish_loop(stop: asyncio.Event) -> None:
         logger.warning("boto3 unavailable; metrics publishing disabled")
         return
 
-    client = boto3.client("cloudwatch")
-    logger.info("publishing metrics to CloudWatch namespace %s", NAMESPACE)
+    try:
+        client = boto3.client("cloudwatch", region_name=resolve_region())
+    except Exception:
+        logger.exception("could not create CloudWatch client; metrics disabled")
+        return
+
+    logger.info(
+        "publishing metrics to CloudWatch namespace %s every %ss",
+        NAMESPACE,
+        FLUSH_SECONDS,
+    )
 
     while not stop.is_set():
         try:
@@ -133,6 +147,12 @@ async def publish_loop(stop: asyncio.Event) -> None:
                 client.put_metric_data,
                 Namespace=NAMESPACE,
                 MetricData=build_metric_data(window),
+            )
+            logger.info(
+                "published metrics: %s requests, %s errors, %s calculations",
+                window.requests,
+                window.errors,
+                window.bmi_calculations,
             )
         except Exception:  # keep serving traffic even if CloudWatch rejects
             logger.exception("failed to publish metrics")
