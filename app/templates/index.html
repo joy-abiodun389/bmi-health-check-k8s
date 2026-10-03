@@ -14,6 +14,13 @@
 <body>
   <div class="atmosphere" aria-hidden="true"></div>
   <main class="shell">
+    <div class="account-bar">
+      <span>Signed in as <strong>{{ full_name }}</strong></span>
+      <form method="post" action="/logout">
+        <button type="submit" class="link-button">Sign out</button>
+      </form>
+    </div>
+
     <header class="brand-block">
       <img
         class="logo"

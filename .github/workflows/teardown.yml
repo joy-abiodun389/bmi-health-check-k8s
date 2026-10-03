@@ -47,12 +47,18 @@ jobs:
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER"
 
-      - name: Delete Kubernetes resources
+      # Deleted by name rather than from the manifests: CI has no delete
+      # rights on the database, so its volume and the registered clients
+      # survive a teardown. Remove it with infra/destroy-database.sh.
+      - name: Delete application resources
         run: |
-          kubectl kustomize k8s/base \
-            | sed "s|__IMAGE__|placeholder|g" \
-            | kubectl delete --ignore-not-found=true -f -
+          set -euo pipefail
+          kubectl -n "$K8S_NAMESPACE" delete --ignore-not-found=true \
+            deployment/bmi-api service/bmi-api poddisruptionbudget/bmi-api \
+            serviceaccount/bmi-api
           kubectl -n "$K8S_NAMESPACE" get all || true
+          echo "Database bmi-db and its volume were left in place (run infra/destroy-database.sh to remove)." \
+            >> "$GITHUB_STEP_SUMMARY"
 
       - name: Delete ECR images
         if: inputs.delete_images

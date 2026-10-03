@@ -169,6 +169,69 @@ input:focus {
   font-size: 0.92rem;
 }
 
+.form-success {
+  margin: 0;
+  color: var(--ok);
+  font-size: 0.92rem;
+}
+
+.field-hint {
+  margin: -0.4rem 0 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.form-switch {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.form-switch a {
+  color: var(--teal);
+  font-weight: 600;
+}
+
+.shell--narrow {
+  width: min(520px, calc(100% - 2rem));
+}
+
+.account-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+  padding: 0.7rem 1rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
+.account-bar strong {
+  color: var(--teal-deep);
+}
+
+.account-bar form {
+  margin: 0;
+}
+
+.link-button {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--teal);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.link-button:hover {
+  text-decoration: underline;
+}
+
 .results {
   margin-top: 1.35rem;
   padding: 1.35rem;

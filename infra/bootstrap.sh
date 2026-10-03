@@ -8,7 +8,8 @@
 #   1. ECR repository for the app image
 #   2. GitHub OIDC provider (if absent) and a deploy IAM role for this repo
 #   3. Namespace + least-privilege RBAC in the cluster
-#   4. aws-auth mapping so the IAM role authenticates to the cluster
+#   4. Database/session credentials secret (generated, never committed)
+#   5. aws-auth mapping so the IAM role authenticates to the cluster
 set -euo pipefail
 
 AWS_REGION="${AWS_REGION:-us-east-2}"
@@ -21,6 +22,10 @@ METRICS_NAMESPACE="${METRICS_NAMESPACE:-BMI/HealthCheck}"
 NAMESPACE="${NAMESPACE:-bmi-api}"
 K8S_GROUP="${K8S_GROUP:-bmi-api-deployers}"
 K8S_USERNAME="${K8S_USERNAME:-gha-bmi-api}"
+DB_SECRET_NAME="${DB_SECRET_NAME:-bmi-db-credentials}"
+DB_NAME="${DB_NAME:-bmi}"
+DB_USER="${DB_USER:-bmi}"
+DB_HOST="${DB_HOST:-bmi-db}"
 
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
@@ -204,6 +209,23 @@ echo "    inline policy put-metric-data applied"
 
 echo "==> Namespace and RBAC"
 kubectl apply -f "${SCRIPT_DIR}/namespace-and-rbac.yaml"
+
+echo "==> Database credentials secret ${DB_SECRET_NAME}"
+# Generated here and never committed. CI has no access to secrets in this
+# namespace, so rotating means re-running this script and restarting the pods.
+if kubectl -n "$NAMESPACE" get secret "$DB_SECRET_NAME" >/dev/null 2>&1; then
+  echo "    already exists (delete it to rotate)"
+else
+  DB_PASSWORD="$(openssl rand -hex 24)"
+  SESSION_SECRET="$(openssl rand -hex 32)"
+  kubectl -n "$NAMESPACE" create secret generic "$DB_SECRET_NAME" \
+    --from-literal=POSTGRES_DB="$DB_NAME" \
+    --from-literal=POSTGRES_USER="$DB_USER" \
+    --from-literal=POSTGRES_PASSWORD="$DB_PASSWORD" \
+    --from-literal=DATABASE_URL="postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:5432/${DB_NAME}" \
+    --from-literal=SESSION_SECRET="$SESSION_SECRET" >/dev/null
+  echo "    created"
+fi
 
 echo "==> aws-auth mapping for ${ROLE_ARN}"
 CURRENT_MAP="$(kubectl -n kube-system get configmap aws-auth -o jsonpath='{.data.mapRoles}')"

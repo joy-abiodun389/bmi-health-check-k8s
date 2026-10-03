@@ -65,6 +65,17 @@ spec:
             # is read-only, so point it at the tmpfs mount.
             - name: HOME
               value: /tmp
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: bmi-db-credentials
+                  key: DATABASE_URL
+            # Every replica must sign session cookies with the same key.
+            - name: SESSION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: bmi-db-credentials
+                  key: SESSION_SECRET
           resources:
             requests:
               cpu: 50m

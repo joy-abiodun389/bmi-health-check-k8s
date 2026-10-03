@@ -71,13 +71,51 @@ good deploy.
 - Non-root (uid 10001), read-only root filesystem, all capabilities dropped, `RuntimeDefault` seccomp
 - PodDisruptionBudget `minAvailable: 1`
 - `/health` reports the serving pod and node via the downward API
+- One `bmi-db` Postgres pod with a persistent volume, reachable only inside the cluster
+
+## Client accounts and the database
+
+The UI is behind a sign-in. `/` and `/bmi` redirect to `/signin` (or answer `401` for JSON
+callers) unless the request carries a valid session; `/health`, `/signup`, `/signin`, and the
+static assets stay public.
+
+Clients live in Postgres, running as a single-replica StatefulSet (`bmi-db`) on a 2Gi `gp2`
+volume — a few cents a month, versus roughly $13/month for the smallest RDS instance. The app
+creates the table on startup if it is missing:
+
+```sql
+clients(id, email UNIQUE, full_name, password_hash, created_at, last_login_at)
+```
+
+Passwords are hashed with `hashlib.scrypt` and a per-user salt, so the image needs no native
+crypto library and plaintext is never stored. Sessions are HMAC-SHA256-signed cookies
+(`bmi_session`, HttpOnly, SameSite=Lax, 12h). The signing key and the database URL both come from
+the `bmi-db-credentials` secret, which `infra/bootstrap.sh` generates — the key **must** be shared
+so a session issued by one replica validates on the other. Set `SESSION_COOKIE_SECURE=true` once
+the endpoint is on TLS.
+
+Without `DATABASE_URL` the app falls back to an in-memory store, which is what makes the test
+suite and local runs work with no database.
+
+### Looking at the data
+
+```bash
+./infra/list-clients.sh                           # registered clients, no hashes
+./infra/db-shell.sh                               # interactive psql in the db pod
+./infra/db-shell.sh "SELECT count(*) FROM clients;"
+```
+
+Both run `psql` inside the pod and read credentials from its environment, so nothing sensitive
+lands in your shell history. CI has no access to secrets in this namespace, and no `delete` on
+statefulsets or PVCs, so a bad apply cannot drop the clients volume.
 
 ## One-time bootstrap
 
 `infra/bootstrap.sh` is idempotent and needs cluster-admin AWS credentials. It creates the ECR
 repo and lifecycle policy, the GitHub OIDC provider (if missing), the deploy IAM role scoped to
 this repo, the `bmi-api-metrics` IRSA role for CloudWatch, the namespace with least-privilege
-RBAC, and the `aws-auth` mapping that lets the deploy role authenticate to the cluster.
+RBAC, the generated `bmi-db-credentials` secret, and the `aws-auth` mapping that lets the deploy
+role authenticate to the cluster.
 
 ```bash
 ./infra/bootstrap.sh
@@ -144,25 +182,30 @@ statistic sets. Alarms have no actions wired yet; point them at an SNS topic to 
 | Alarms (2) | ~$0.20 |
 | Dashboard | $0 (first 3 free) |
 | ECR storage (keep last 5) | a few cents |
+| 2Gi gp2 volume for Postgres | ~$0.20 |
 
 ## Endpoints
 
-| Method | Path | Description |
-| --- | --- | --- |
-| `GET` | `/` | End-user UI |
-| `GET` | `/health` | Probe payload: `status`, `pod`, `node` |
-| `GET` | `/bmi?height_cm=175&weight_kg=70` | BMI + advice via query params |
-| `POST` | `/bmi` | BMI + advice via JSON body |
+| Method | Path | Auth | Description |
+| --- | --- | --- | --- |
+| `GET` | `/` | session | End-user UI |
+| `GET` | `/signup` · `POST` `/signup` | public | Register a client |
+| `GET` | `/signin` · `POST` `/signin` | public | Start a session |
+| `POST` | `/logout` | — | Clear the session cookie |
+| `GET` | `/health` | public | Probe payload: `status`, `pod`, `node` |
+| `GET` | `/me` | session | The signed-in client's record |
+| `GET` | `/bmi?height_cm=175&weight_kg=70` | session | BMI + advice via query params |
+| `POST` | `/bmi` | session | BMI + advice via JSON body |
 
 ## Layout
 
 ```text
-app/                  FastAPI app, BMI + advice logic, CloudWatch metrics, UI assets
+app/                  FastAPI app, BMI + advice logic, auth, client storage, metrics, UI
 tests/                unit tests
 Dockerfile            non-root python:3.12-slim image
-k8s/base/             ServiceAccount, Deployment, Service, PDB (kustomize)
+k8s/base/             ServiceAccount, Deployment, Service, PDB, Postgres (kustomize)
 k8s/overlays/public/  NLB exposure (what CI deploys)
-infra/                bootstrap, namespace + RBAC, dashboard and alarms
+infra/                bootstrap, namespace + RBAC, dashboard and alarms, psql helpers
 .github/workflows/    deploy and teardown pipelines
 .github/scripts/      Slack notifier
 ```

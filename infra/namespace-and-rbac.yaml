@@ -20,6 +20,14 @@ rules:
   - apiGroups: ["apps"]
     resources: ["replicasets"]
     verbs: ["get", "list", "watch"]
+  # The database StatefulSet ships with the app manifests. Delete is withheld
+  # so a bad apply can never drop the clients table's volume.
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["services", "serviceaccounts", "configmaps"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

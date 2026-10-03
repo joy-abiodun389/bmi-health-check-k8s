@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sign in — BMI Health Check</title>
+  <link rel="icon" type="image/png" href="/static/excelcloud-mark.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Sora:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="atmosphere" aria-hidden="true"></div>
+  <main class="shell shell--narrow">
+    <header class="brand-block">
+      <img class="logo" src="/static/excelcloud-logo.jpg" alt="ExcelCloud — Cloud Engineering, Software, Consulting" width="968" height="272" />
+      <p class="brand">Welcome back</p>
+      <p class="lede">Sign in to calculate your BMI and get tailored health and exercise guidance.</p>
+    </header>
+
+    <form class="intake" method="post" action="/signin">
+      {% if registered %}
+        <p class="form-success">Account created. Sign in to continue.</p>
+      {% endif %}
+      {% if error %}
+        <p class="form-error">{{ error }}</p>
+      {% endif %}
+
+      <label>
+        <span>Email</span>
+        <input type="email" name="email" value="{{ email or '' }}" autocomplete="email" required />
+      </label>
+      <label>
+        <span>Password</span>
+        <input type="password" name="password" autocomplete="current-password" required />
+      </label>
+
+      <button type="submit" class="cta">Sign in</button>
+      <p class="form-switch">New here? <a href="/signup">Create an account</a></p>
+    </form>
+
+    <footer class="site-footer">
+      <img class="footer-mark" src="/static/excelcloud-mark.png" alt="" width="256" height="256" />
+      <span>An <strong>ExcelCloud</strong> application</span>
+    </footer>
+  </main>
+</body>
+</html>

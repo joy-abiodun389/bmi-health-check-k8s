@@ -59,6 +59,11 @@
         body: JSON.stringify({ height_cm, weight_kg }),
       });
 
+      if (response.status === 401) {
+        window.location.href = "/signin";
+        return;
+      }
+
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
         const detail = payload.detail;

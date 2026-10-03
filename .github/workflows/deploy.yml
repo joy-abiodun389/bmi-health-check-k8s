@@ -28,6 +28,7 @@ env:
   ECR_REPOSITORY: bmi-health-check-api
   K8S_NAMESPACE: bmi-api
   DEPLOYMENT: bmi-api
+  DB_STATEFULSET: bmi-db
   DASHBOARD_NAME: bmi-health-check
 
 jobs:
@@ -156,6 +157,8 @@ jobs:
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
       # Default to the public NLB overlay; manual runs can opt out.
       EXPOSE_PUBLIC: ${{ github.event_name == 'workflow_dispatch' && inputs.expose_public || 'true' }}
+      # Unique per run, and on a reserved TLD so it can never reach a mailbox.
+      SMOKE_EMAIL: smoke-${{ github.run_id }}-${{ github.run_attempt }}@ci.invalid
     steps:
       - uses: actions/checkout@v4
 
@@ -181,6 +184,9 @@ jobs:
             | sed "s|__IMAGE__|${IMAGE_REF}|g" \
             | kubectl apply -f -
 
+      - name: Wait for database
+        run: kubectl -n "$K8S_NAMESPACE" rollout status "statefulset/${DB_STATEFULSET}" --timeout=300s
+
       - name: Wait for rollout
         run: kubectl -n "$K8S_NAMESPACE" rollout status "deployment/${DEPLOYMENT}" --timeout=300s
 
@@ -192,31 +198,88 @@ jobs:
             --field-selector status.phase=Running \
             -o jsonpath='{.items[0].metadata.name}')
           echo "Probing from pod ${POD}"
-          kubectl -n "$K8S_NAMESPACE" exec -i "$POD" -- python - <<'PY'
+          # kubectl exec has no --env, so the address goes in as an argument.
+          kubectl -n "$K8S_NAMESPACE" exec -i "$POD" -- python - "$SMOKE_EMAIL" <<'PY'
           import json
+          import sys
+          import urllib.error
+          import urllib.parse
           import urllib.request
+          from http.cookiejar import CookieJar
 
-          def get(url):
-              with urllib.request.urlopen(url, timeout=10) as response:
-                  return json.load(response)
+          BASE = "http://bmi-api.bmi-api.svc.cluster.local"
+          EMAIL = sys.argv[1]
+          PASSWORD = "smoke-test-password"
 
-          health = get("http://127.0.0.1:8080/health")
+          health = json.load(urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=10))
           assert health["status"] == "ok", health
           print("health ok on pod", health.get("pod"), "node", health.get("node"))
 
-          # Through the Service, proving DNS and endpoint routing work.
-          bmi = get("http://bmi-api.bmi-api.svc.cluster.local/bmi?height_cm=175&weight_kg=70")
-          assert bmi["category"] == "normal", bmi
-          assert bmi["bmi"] == 22.9, bmi
-          assert bmi["health_advice"], bmi
-          assert bmi["exercises"], bmi
-          print("service routing ok, bmi", bmi["bmi"], bmi["category"])
+          # Anonymous visitors must be bounced to the sign-in page.
+          anon = urllib.request.urlopen(BASE + "/", timeout=10)
+          assert "Welcome back" in anon.read().decode(), "anonymous request was not redirected to /signin"
+          try:
+              urllib.request.urlopen(BASE + "/bmi?height_cm=175&weight_kg=70", timeout=10)
+              raise AssertionError("/bmi answered without a session")
+          except urllib.error.HTTPError as exc:
+              assert exc.code == 401, exc.code
+          print("unauthenticated access blocked")
 
-          page = urllib.request.urlopen("http://127.0.0.1:8080/", timeout=10).read().decode()
-          assert "BMI Health Check" in page
-          print("UI ok")
+          # One opener keeps the session cookie, like a real browser.
+          browser = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(CookieJar()))
+
+          def post_form(path, fields):
+              body = urllib.parse.urlencode(fields).encode()
+              return browser.open(BASE + path, data=body, timeout=15)
+
+          page = post_form("/signup", {
+              "full_name": "CI Smoke Test",
+              "email": EMAIL,
+              "password": PASSWORD,
+              "confirm_password": PASSWORD,
+          }).read().decode()
+          assert "Signed in as" in page and "CI Smoke Test" in page, "signup did not land on the app"
+          print("signup wrote", EMAIL, "and started a session")
+
+          browser.open(BASE + "/logout", data=b"", timeout=15)
+          page = post_form("/signin", {"email": EMAIL, "password": PASSWORD}).read().decode()
+          assert "BMI Health Check" in page, "signin did not reach the calculator"
+          print("signin ok")
+
+          # Several calls so the Service hits both replicas; they can only all
+          # succeed if every pod signs cookies with the same shared secret.
+          pods = set()
+          for _ in range(6):
+              request = urllib.request.Request(
+                  BASE + "/bmi",
+                  data=json.dumps({"height_cm": 175, "weight_kg": 70}).encode(),
+                  headers={"Content-Type": "application/json"},
+              )
+              bmi = json.load(browser.open(request, timeout=15))
+              assert bmi["bmi"] == 22.9 and bmi["category"] == "normal", bmi
+              assert bmi["health_advice"] and bmi["exercises"], bmi
+              pods.add(json.load(browser.open(BASE + "/health", timeout=10)).get("pod"))
+          print("bmi ok across pods:", ", ".join(sorted(p or "?" for p in pods)))
+
+          me = json.load(browser.open(BASE + "/me", timeout=10))
+          assert me["email"] == EMAIL and me["last_login_at"], me
+          print("session identity ok")
           print("Smoke tests passed")
           PY
+
+      - name: Verify the row landed in Postgres
+        run: |
+          set -euo pipefail
+          DB_POD="${DB_STATEFULSET}-0"
+          ROW=$(kubectl -n "$K8S_NAMESPACE" exec -i "$DB_POD" -- sh -c \
+            "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -tAc \
+             \"SELECT full_name FROM clients WHERE email = '${SMOKE_EMAIL}'\"")
+          echo "clients row: ${ROW}"
+          [ "$ROW" = "CI Smoke Test" ]
+          # Remove the synthetic account so the table only holds real clients.
+          kubectl -n "$K8S_NAMESPACE" exec -i "$DB_POD" -- sh -c \
+            "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -c \
+             \"DELETE FROM clients WHERE email LIKE 'smoke-%@ci.invalid'\""
 
       - name: Wait for load balancer
         id: lb
@@ -293,3 +356,10 @@ jobs:
           echo "::group::Container logs"
           kubectl -n "$K8S_NAMESPACE" logs "deployment/${DEPLOYMENT}" --all-containers --tail=100 || true
           echo "::endgroup::"
+          echo "::group::Database"
+          kubectl -n "$K8S_NAMESPACE" describe "statefulset/${DB_STATEFULSET}" || true
+          kubectl -n "$K8S_NAMESPACE" logs "statefulset/${DB_STATEFULSET}" --tail=80 || true
+          echo "::endgroup::"
+          # CI deliberately cannot read secrets, so a missing credentials
+          # secret shows up as CreateContainerConfigError above.
+          echo "If pods cannot start on bmi-db-credentials, re-run infra/bootstrap.sh."
